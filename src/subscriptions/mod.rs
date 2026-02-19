@@ -6,6 +6,7 @@ pub mod futures;
 mod outstanding;
 pub mod paging;
 mod pulled_message;
+mod retry_queue;
 mod stats;
 mod subscription;
 mod subscription_actor;

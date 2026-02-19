@@ -1,6 +1,6 @@
 use deltio::pubsub_proto::{
     DeleteSubscriptionRequest, GetSubscriptionRequest, ListSubscriptionsRequest, PublishRequest,
-    PubsubMessage, PullRequest, StreamingPullResponse,
+    PubsubMessage, PullRequest, RetryPolicy as RetryPolicyProto, StreamingPullResponse,
 };
 use deltio::subscriptions::SubscriptionName;
 use deltio::topics::TopicName;
@@ -542,4 +542,181 @@ fn collect_text_messages(pull_response: &StreamingPullResponse) -> Vec<String> {
         .iter()
         .map(|m| String::from_utf8(m.message.clone().unwrap().data).unwrap())
         .collect::<Vec<_>>()
+}
+
+#[tokio::test]
+async fn test_retry_policy_with_backoff() {
+    time::pause();
+
+    let mut server = TestHost::start().await.unwrap();
+
+    let topic_name = TopicName::new("test", "topic");
+    server.create_topic_with_name(&topic_name).await;
+
+    // Create a subscription with a retry policy (1s min, 10s max backoff).
+    let subscription_name = SubscriptionName::new("test", "retry_sub");
+    let mut resource = map_to_subscription_resource(&subscription_name, &topic_name);
+    resource.retry_policy = Some(RetryPolicyProto {
+        minimum_backoff: Some(prost_types::Duration {
+            seconds: 1,
+            nanos: 0,
+        }),
+        maximum_backoff: Some(prost_types::Duration {
+            seconds: 10,
+            nanos: 0,
+        }),
+    });
+    let subscription_response = server
+        .subscriber
+        .create_subscription(resource)
+        .await
+        .unwrap();
+
+    // Verify the retry policy is returned.
+    let sub = subscription_response.get_ref();
+    assert!(sub.retry_policy.is_some());
+    let rp = sub.retry_policy.as_ref().unwrap();
+    assert_eq!(rp.minimum_backoff.as_ref().unwrap().seconds, 1);
+    assert_eq!(rp.maximum_backoff.as_ref().unwrap().seconds, 10);
+
+    // Start streaming pull.
+    let (sender, mut inbound) = server.streaming_pull(&subscription_name).await;
+
+    // Publish a message.
+    server
+        .publish_text_messages(&topic_name, vec!["retry_me".into()])
+        .await;
+
+    // Pull the message.
+    let pull_response = inbound.next().await.unwrap().unwrap();
+    assert_eq!(pull_response.received_messages.len(), 1);
+    let received = &pull_response.received_messages[0];
+    assert_eq!(received.delivery_attempt, 1);
+    let ack_id = received.ack_id.clone();
+
+    // NACK the message.
+    sender
+        .send(streaming_nack(vec![ack_id]))
+        .await
+        .unwrap();
+
+    // Advance time by 500ms — not enough for the 1s backoff.
+    time::advance(Duration::from_millis(500)).await;
+
+    // Publish another message to trigger notification and verify no redelivery of nacked message.
+    // Instead, just advance past the backoff.
+    time::advance(Duration::from_millis(600)).await;
+
+    // Now the 1s backoff should have elapsed, we should get the message redelivered.
+    let pull_response = inbound.next().await.unwrap().unwrap();
+    assert_eq!(pull_response.received_messages.len(), 1);
+    let received = &pull_response.received_messages[0];
+    assert_eq!(
+        String::from_utf8(received.message.clone().unwrap().data).unwrap(),
+        "retry_me"
+    );
+    assert_eq!(received.delivery_attempt, 2);
+
+    drop(sender);
+    drop(inbound);
+    server.dispose().await;
+}
+
+#[tokio::test]
+async fn test_no_retry_policy_immediate_redelivery() {
+    let mut server = TestHost::start().await.unwrap();
+
+    let topic_name = TopicName::new("test", "topic");
+    server.create_topic_with_name(&topic_name).await;
+
+    // Create a subscription WITHOUT a retry policy.
+    let subscription_name = SubscriptionName::new("test", "no_retry_sub");
+    server
+        .create_subscription_with_name(&topic_name, &subscription_name)
+        .await;
+
+    // Start streaming pull.
+    let (sender, mut inbound) = server.streaming_pull(&subscription_name).await;
+
+    // Publish a message.
+    server
+        .publish_text_messages(&topic_name, vec!["immediate".into()])
+        .await;
+
+    // Pull the message.
+    let pull_response = inbound.next().await.unwrap().unwrap();
+    assert_eq!(pull_response.received_messages.len(), 1);
+    let ack_id = pull_response.received_messages[0].ack_id.clone();
+
+    // NACK it — should be immediately redelivered (no backoff).
+    sender
+        .send(streaming_nack(vec![ack_id]))
+        .await
+        .unwrap();
+
+    // Pause time to ensure we're not relying on real time.
+    time::pause();
+    time::advance(Duration::from_secs(1)).await;
+    time::resume();
+
+    let pull_response = inbound.next().await.unwrap().unwrap();
+    assert_eq!(pull_response.received_messages.len(), 1);
+    assert_eq!(
+        String::from_utf8(
+            pull_response.received_messages[0]
+                .message
+                .clone()
+                .unwrap()
+                .data
+        )
+        .unwrap(),
+        "immediate"
+    );
+
+    drop(sender);
+    drop(inbound);
+    server.dispose().await;
+}
+
+#[tokio::test]
+async fn test_retry_policy_stored_and_returned() {
+    let mut server = TestHost::start().await.unwrap();
+
+    let topic_name = TopicName::new("test", "topic");
+    server.create_topic_with_name(&topic_name).await;
+
+    let subscription_name = SubscriptionName::new("test", "retry_store");
+    let mut resource = map_to_subscription_resource(&subscription_name, &topic_name);
+    resource.retry_policy = Some(RetryPolicyProto {
+        minimum_backoff: Some(prost_types::Duration {
+            seconds: 5,
+            nanos: 0,
+        }),
+        maximum_backoff: Some(prost_types::Duration {
+            seconds: 300,
+            nanos: 0,
+        }),
+    });
+
+    server
+        .subscriber
+        .create_subscription(resource)
+        .await
+        .unwrap();
+
+    // Retrieve and verify the retry policy is persisted.
+    let response = server
+        .subscriber
+        .get_subscription(GetSubscriptionRequest {
+            subscription: subscription_name.to_string(),
+        })
+        .await
+        .unwrap();
+
+    let sub = response.get_ref();
+    let rp = sub.retry_policy.as_ref().expect("retry_policy should be set");
+    assert_eq!(rp.minimum_backoff.as_ref().unwrap().seconds, 5);
+    assert_eq!(rp.maximum_backoff.as_ref().unwrap().seconds, 300);
+
+    server.dispose().await;
 }

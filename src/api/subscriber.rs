@@ -7,8 +7,8 @@ use crate::pubsub_proto::{
     GetSnapshotRequest, GetSubscriptionRequest, ListSnapshotsRequest, ListSnapshotsResponse,
     ListSubscriptionsRequest, ListSubscriptionsResponse, ModifyAckDeadlineRequest,
     ModifyPushConfigRequest, PubsubMessage, PullRequest, PullResponse, PushConfig, ReceivedMessage,
-    SeekRequest, SeekResponse, Snapshot, StreamingPullRequest, StreamingPullResponse, Subscription,
-    UpdateSnapshotRequest, UpdateSubscriptionRequest,
+    RetryPolicy as RetryPolicyProto, SeekRequest, SeekResponse, Snapshot, StreamingPullRequest,
+    StreamingPullResponse, Subscription, UpdateSnapshotRequest, UpdateSubscriptionRequest,
 };
 use crate::subscriptions::subscription_manager::SubscriptionManager;
 use crate::subscriptions::{
@@ -65,8 +65,17 @@ impl Subscriber for SubscriberService {
             .as_ref()
             .map(parser::parse_push_config)
             .transpose()?;
-        let subscription_info =
-            SubscriptionInfo::new(subscription_name.clone(), ack_deadline, push_config);
+        let retry_policy = request
+            .retry_policy
+            .as_ref()
+            .map(parser::parse_retry_policy)
+            .transpose()?;
+        let subscription_info = SubscriptionInfo::new(
+            subscription_name.clone(),
+            ack_deadline,
+            push_config,
+            retry_policy,
+        );
 
         let topic = self
             .topic_manager
@@ -602,7 +611,7 @@ fn get_subscription(
 fn map_to_received_message(m: &PulledMessage) -> ReceivedMessage {
     ReceivedMessage {
         ack_id: m.ack_id().to_string(),
-        delivery_attempt: 0, // m.delivery_attempt() as i32,
+        delivery_attempt: m.delivery_attempt() as i32,
         message: {
             let message = m.message();
             Some(PubsubMessage {
@@ -654,7 +663,16 @@ fn map_to_subscription_resource(
         expiration_policy: None,
         filter: Default::default(),
         dead_letter_policy: None,
-        retry_policy: None,
+        retry_policy: info.retry_policy.as_ref().map(|rp| RetryPolicyProto {
+            minimum_backoff: Some(prost_types::Duration {
+                seconds: rp.minimum_backoff.as_secs() as i64,
+                nanos: rp.minimum_backoff.subsec_nanos() as i32,
+            }),
+            maximum_backoff: Some(prost_types::Duration {
+                seconds: rp.maximum_backoff.as_secs() as i64,
+                nanos: rp.maximum_backoff.subsec_nanos() as i32,
+            }),
+        }),
         detached: false,
         enable_exactly_once_delivery: false,
         topic_message_retention_duration: None,

@@ -3,15 +3,17 @@ use crate::push::PushSubscriptionsRegistry;
 use crate::subscriptions::errors::*;
 use crate::subscriptions::futures::{Deleted, MessagesAvailable};
 use crate::subscriptions::outstanding::OutstandingMessageTracker;
+use crate::subscriptions::retry_queue::RetryQueue;
 use crate::subscriptions::subscription_manager::SubscriptionManagerDelegate;
 use crate::subscriptions::{
     AckDeadline, AckId, AcknowledgeMessagesError, DeadlineModification, PulledMessage,
     SubscriptionInfo, SubscriptionStats,
 };
-use crate::topics::{RemoveSubscriptionError, Topic, TopicMessage, TopicName};
+use crate::topics::{MessageId, RemoveSubscriptionError, Topic, TopicMessage, TopicName};
 use futures::future::Shared;
 use futures::FutureExt;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::Instant;
@@ -81,6 +83,12 @@ pub(crate) struct SubscriptionActor {
 
     /// Whether the subscription has been marked as deleted.
     deleted: bool,
+
+    /// Tracks delivery attempt count per message (keyed by message ID).
+    delivery_attempts: HashMap<MessageId, u16>,
+
+    /// Holds messages waiting for their retry backoff delay to elapse.
+    retry_queue: RetryQueue,
 }
 
 impl SubscriptionActor {
@@ -111,6 +119,8 @@ impl SubscriptionActor {
             outstanding: OutstandingMessageTracker::new(),
             next_ack_id: AckId::new(1),
             deleted: false,
+            delivery_attempts: HashMap::new(),
+            retry_queue: RetryQueue::new(),
         };
 
         tokio::spawn(async move {
@@ -123,6 +133,9 @@ impl SubscriptionActor {
                         },
                         Some(expired) = actor.outstanding.poll_next_expired() => {
                             actor.handle_expired_messages(expired);
+                        },
+                        Some(ready) = actor.retry_queue.poll_next_ready() => {
+                            actor.handle_retry_ready(ready);
                         }
                     }
                 }
@@ -208,8 +221,14 @@ impl SubscriptionActor {
             let ack_id = self.next_ack_id;
             self.next_ack_id = ack_id.next();
 
+            let delivery_attempt = self
+                .delivery_attempts
+                .get(&message.id)
+                .copied()
+                .unwrap_or(1);
             let deadline = AckDeadline::new(&deadline);
-            let pulled_message = PulledMessage::new(Arc::clone(&message), ack_id, deadline, 1);
+            let pulled_message =
+                PulledMessage::new(Arc::clone(&message), ack_id, deadline, delivery_attempt);
             result.push(pulled_message.clone());
 
             // Track the outstanding message so we can ACK it later (and also expire it).
@@ -237,7 +256,10 @@ impl SubscriptionActor {
             return Ok(());
         }
 
-        self.outstanding.remove(ack_ids.into_iter());
+        let acked = self.outstanding.remove(ack_ids.into_iter());
+        for message in &acked {
+            self.delivery_attempts.remove(&message.message().id);
+        }
 
         Ok(())
     }
@@ -252,11 +274,7 @@ impl SubscriptionActor {
         }
 
         let nacks = self.outstanding.modify(deadline_modifications);
-        let messages_to_requeue = nacks.into_iter().map(|m| m.into_message());
-        self.backlog.append(messages_to_requeue);
-        if !self.backlog.is_empty() {
-            self.observer.notify_new_messages_available();
-        }
+        self.requeue_messages(nacks);
 
         Ok(())
     }
@@ -283,6 +301,8 @@ impl SubscriptionActor {
         self.observer.notify_deleted();
         self.outstanding.clear();
         self.backlog.clear();
+        self.retry_queue.clear();
+        self.delivery_attempts.clear();
 
         // Unregister the subscription from push.
         self.push_registry.set(self.info.name.clone(), None);
@@ -299,17 +319,53 @@ impl SubscriptionActor {
                 .map(|t| t.name.clone())
                 .unwrap_or_else(TopicName::deleted),
             self.outstanding.len(),
-            self.backlog.len(),
+            self.backlog.len() + self.retry_queue.len(),
         );
         Ok(stats)
     }
 
-    /// Handles expired messages by putting them back into the backlog.
+    /// Handles expired messages by requeueing them (with retry backoff if configured).
     fn handle_expired_messages(&mut self, expired: Vec<PulledMessage>) {
         log::debug!("{}: {} messages expired", &self.info.name, expired.len());
-        self.backlog
-            .append(expired.into_iter().map(|p| p.into_message()));
+        self.requeue_messages(expired);
+    }
 
+    /// Requeues messages after a nack or deadline expiry, applying retry backoff if configured.
+    fn requeue_messages(&mut self, messages: Vec<PulledMessage>) {
+        let now = Instant::now();
+        for pulled in messages {
+            let message = pulled.into_message();
+            let message_id = message.id;
+
+            // Increment delivery attempt.
+            let attempt = self
+                .delivery_attempts
+                .entry(message_id)
+                .and_modify(|a| *a = a.saturating_add(1))
+                .or_insert(2);
+
+            if let Some(ref retry_policy) = self.info.retry_policy {
+                let backoff = retry_policy.calculate_backoff(*attempt);
+                let deliver_at = AckDeadline::new(&(now + backoff));
+                self.retry_queue.add(message, deliver_at);
+            } else {
+                self.backlog.append(std::iter::once(message));
+            }
+        }
+
+        if !self.backlog.is_empty() {
+            self.observer.notify_new_messages_available();
+        }
+    }
+
+    /// Handles messages whose retry backoff has elapsed by moving them to the backlog.
+    fn handle_retry_ready(&mut self, ready: Vec<Arc<TopicMessage>>) {
+        log::debug!(
+            "{}: {} retry messages ready",
+            &self.info.name,
+            ready.len()
+        );
+        self.backlog.append(ready);
         if !self.backlog.is_empty() {
             self.observer.notify_new_messages_available();
         }
