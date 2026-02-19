@@ -47,10 +47,14 @@ impl Deltio {
     /// Creates a new Deltio components wrapper.
     pub fn new() -> Self {
         let push_subscriptions_registry = PushSubscriptionsRegistry::new();
+        let topic_manager = Arc::new(TopicManager::new());
         Self {
             push_subscriptions_registry: push_subscriptions_registry.clone(),
-            topic_manager: Arc::new(TopicManager::new()),
-            subscription_manager: Arc::new(SubscriptionManager::new(push_subscriptions_registry)),
+            topic_manager: Arc::clone(&topic_manager),
+            subscription_manager: Arc::new(SubscriptionManager::new(
+                push_subscriptions_registry,
+                topic_manager,
+            )),
         }
     }
 

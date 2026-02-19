@@ -3,12 +3,13 @@ use crate::api::parser;
 use crate::pubsub_proto::push_config::{AuthenticationMethod, OidcToken};
 use crate::pubsub_proto::subscriber_server::Subscriber;
 use crate::pubsub_proto::{
-    AcknowledgeRequest, CreateSnapshotRequest, DeleteSnapshotRequest, DeleteSubscriptionRequest,
-    GetSnapshotRequest, GetSubscriptionRequest, ListSnapshotsRequest, ListSnapshotsResponse,
-    ListSubscriptionsRequest, ListSubscriptionsResponse, ModifyAckDeadlineRequest,
-    ModifyPushConfigRequest, PubsubMessage, PullRequest, PullResponse, PushConfig, ReceivedMessage,
-    RetryPolicy as RetryPolicyProto, SeekRequest, SeekResponse, Snapshot, StreamingPullRequest,
-    StreamingPullResponse, Subscription, UpdateSnapshotRequest, UpdateSubscriptionRequest,
+    AcknowledgeRequest, CreateSnapshotRequest, DeadLetterPolicy as DeadLetterPolicyProto,
+    DeleteSnapshotRequest, DeleteSubscriptionRequest, GetSnapshotRequest, GetSubscriptionRequest,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListSubscriptionsRequest,
+    ListSubscriptionsResponse, ModifyAckDeadlineRequest, ModifyPushConfigRequest, PubsubMessage,
+    PullRequest, PullResponse, PushConfig, ReceivedMessage, RetryPolicy as RetryPolicyProto,
+    SeekRequest, SeekResponse, Snapshot, StreamingPullRequest, StreamingPullResponse, Subscription,
+    UpdateSnapshotRequest, UpdateSubscriptionRequest,
 };
 use crate::subscriptions::subscription_manager::SubscriptionManager;
 use crate::subscriptions::{
@@ -70,11 +71,17 @@ impl Subscriber for SubscriberService {
             .as_ref()
             .map(parser::parse_retry_policy)
             .transpose()?;
+        let dead_letter_policy = request
+            .dead_letter_policy
+            .as_ref()
+            .map(parser::parse_dead_letter_policy)
+            .transpose()?;
         let subscription_info = SubscriptionInfo::new(
             subscription_name.clone(),
             ack_deadline,
             push_config,
             retry_policy,
+            dead_letter_policy,
         );
 
         let topic = self
@@ -99,6 +106,9 @@ impl Subscriber for SubscriberService {
                 CreateSubscriptionError::MustBeInSameProjectAsTopic => Status::invalid_argument(
                     "The subscription must be in the same project as the topic",
                 ),
+                CreateSubscriptionError::DeadLetterTopicDoesNotExist => {
+                    Status::not_found("The dead letter topic does not exist")
+                }
                 CreateSubscriptionError::Closed => conflict(),
             })?;
 
@@ -662,7 +672,10 @@ fn map_to_subscription_resource(
         enable_message_ordering: false,
         expiration_policy: None,
         filter: Default::default(),
-        dead_letter_policy: None,
+        dead_letter_policy: info.dead_letter_policy.as_ref().map(|dlp| DeadLetterPolicyProto {
+            dead_letter_topic: dlp.dead_letter_topic.to_string(),
+            max_delivery_attempts: dlp.max_delivery_attempts,
+        }),
         retry_policy: info.retry_policy.as_ref().map(|rp| RetryPolicyProto {
             minimum_backoff: Some(prost_types::Duration {
                 seconds: rp.minimum_backoff.as_secs() as i64,

@@ -9,6 +9,7 @@ use crate::subscriptions::{
     AckDeadline, AckId, AcknowledgeMessagesError, DeadlineModification, PulledMessage,
     SubscriptionInfo, SubscriptionStats,
 };
+use crate::topics::topic_manager::TopicManager;
 use crate::topics::{MessageId, RemoveSubscriptionError, Topic, TopicMessage, TopicName};
 use futures::future::Shared;
 use futures::FutureExt;
@@ -89,6 +90,10 @@ pub(crate) struct SubscriptionActor {
 
     /// Holds messages waiting for their retry backoff delay to elapse.
     retry_queue: RetryQueue,
+
+    /// The topic manager, used for publishing to the dead letter topic.
+    /// Only `Some` when a dead letter policy is configured.
+    topic_manager: Option<Arc<TopicManager>>,
 }
 
 impl SubscriptionActor {
@@ -100,6 +105,7 @@ impl SubscriptionActor {
         observer: Arc<SubscriptionObserver>,
         push_registry: PushSubscriptionsRegistry,
         delegate: SubscriptionManagerDelegate,
+        topic_manager: Option<Arc<TopicManager>>,
     ) -> mpsc::Sender<SubscriptionRequest> {
         let (sender, mut receiver) = mpsc::channel(16);
 
@@ -121,6 +127,7 @@ impl SubscriptionActor {
             deleted: false,
             delivery_attempts: HashMap::new(),
             retry_queue: RetryQueue::new(),
+            topic_manager,
         };
 
         tokio::spawn(async move {
@@ -132,7 +139,7 @@ impl SubscriptionActor {
                             actor.receive(request).await
                         },
                         Some(expired) = actor.outstanding.poll_next_expired() => {
-                            actor.handle_expired_messages(expired);
+                            actor.handle_expired_messages(expired).await;
                         },
                         Some(ready) = actor.retry_queue.poll_next_ready() => {
                             actor.handle_retry_ready(ready);
@@ -175,7 +182,7 @@ impl SubscriptionActor {
                 deadline_modifications,
                 responder,
             } => {
-                let result = self.modify_deadline(deadline_modifications);
+                let result = self.modify_deadline(deadline_modifications).await;
                 let _ = responder.send(result);
             }
             SubscriptionRequest::Delete { responder } => {
@@ -265,7 +272,7 @@ impl SubscriptionActor {
     }
 
     /// Modifies the deadline for messages that have been pulled.
-    fn modify_deadline(
+    async fn modify_deadline(
         &mut self,
         deadline_modifications: Vec<DeadlineModification>,
     ) -> Result<(), ModifyDeadlineError> {
@@ -274,7 +281,7 @@ impl SubscriptionActor {
         }
 
         let nacks = self.outstanding.modify(deadline_modifications);
-        self.requeue_messages(nacks);
+        self.requeue_messages(nacks).await;
 
         Ok(())
     }
@@ -325,14 +332,19 @@ impl SubscriptionActor {
     }
 
     /// Handles expired messages by requeueing them (with retry backoff if configured).
-    fn handle_expired_messages(&mut self, expired: Vec<PulledMessage>) {
+    async fn handle_expired_messages(&mut self, expired: Vec<PulledMessage>) {
         log::debug!("{}: {} messages expired", &self.info.name, expired.len());
-        self.requeue_messages(expired);
+        self.requeue_messages(expired).await;
     }
 
     /// Requeues messages after a nack or deadline expiry, applying retry backoff if configured.
-    fn requeue_messages(&mut self, messages: Vec<PulledMessage>) {
+    /// If a dead letter policy is configured and the max delivery attempts have been exceeded,
+    /// the message is forwarded to the dead letter topic instead.
+    async fn requeue_messages(&mut self, messages: Vec<PulledMessage>) {
         let now = Instant::now();
+        let mut dead_letter_messages: Vec<TopicMessage> = Vec::new();
+        let mut dead_letter_message_ids: Vec<MessageId> = Vec::new();
+
         for pulled in messages {
             let message = pulled.into_message();
             let message_id = message.id;
@@ -344,12 +356,65 @@ impl SubscriptionActor {
                 .and_modify(|a| *a = a.saturating_add(1))
                 .or_insert(2);
 
+            // Check if we should dead-letter this message.
+            if let Some(ref dlp) = self.info.dead_letter_policy {
+                if *attempt as i32 >= dlp.max_delivery_attempts {
+                    // Create a new TopicMessage for the DLQ topic from the original.
+                    let dlq_message =
+                        TopicMessage::new(message.data.clone(), message.attributes.clone());
+                    dead_letter_messages.push(dlq_message);
+                    dead_letter_message_ids.push(message_id);
+                    continue;
+                }
+            }
+
             if let Some(ref retry_policy) = self.info.retry_policy {
                 let backoff = retry_policy.calculate_backoff(*attempt);
                 let deliver_at = AckDeadline::new(&(now + backoff));
                 self.retry_queue.add(message, deliver_at);
             } else {
                 self.backlog.append(std::iter::once(message));
+            }
+        }
+
+        // Publish dead-lettered messages to the DLQ topic.
+        if !dead_letter_messages.is_empty() {
+            if let Some(ref topic_manager) = self.topic_manager {
+                let dlp = self.info.dead_letter_policy.as_ref().unwrap();
+                match topic_manager.get_topic(&dlp.dead_letter_topic) {
+                    Ok(dlq_topic) => {
+                        let count = dead_letter_messages.len();
+                        if let Err(e) = dlq_topic.publish_messages(dead_letter_messages).await {
+                            log::warn!(
+                                "{}: failed to publish {} messages to dead letter topic {}: {}",
+                                &self.info.name,
+                                count,
+                                &dlp.dead_letter_topic,
+                                e
+                            );
+                        } else {
+                            log::debug!(
+                                "{}: dead-lettered {} messages to {}",
+                                &self.info.name,
+                                count,
+                                &dlp.dead_letter_topic
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "{}: dead letter topic {} no longer exists, dropping {} messages",
+                            &self.info.name,
+                            &dlp.dead_letter_topic,
+                            dead_letter_messages.len()
+                        );
+                    }
+                }
+            }
+
+            // Clean up delivery attempts for dead-lettered messages.
+            for id in &dead_letter_message_ids {
+                self.delivery_attempts.remove(id);
             }
         }
 

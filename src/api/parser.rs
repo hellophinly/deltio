@@ -2,11 +2,12 @@ use crate::api::page_token::PageToken;
 use crate::paging::Paging;
 use crate::pubsub_proto::push_config::AuthenticationMethod;
 use crate::pubsub_proto::{
-    PubsubMessage, PushConfig as PushConfigProto, RetryPolicy as RetryPolicyProto,
+    DeadLetterPolicy as DeadLetterPolicyProto, PubsubMessage, PushConfig as PushConfigProto,
+    RetryPolicy as RetryPolicyProto,
 };
 use crate::subscriptions::{
-    AckDeadline, AckId, AckIdParseError, DeadlineModification, PushConfig, PushConfigOidcToken,
-    RetryPolicy, SubscriptionName,
+    AckDeadline, AckId, AckIdParseError, DeadLetterPolicy, DeadlineModification, PushConfig,
+    PushConfigOidcToken, RetryPolicy, SubscriptionName,
 };
 use crate::topics::{TopicMessage, TopicName};
 use bytes::Bytes;
@@ -172,6 +173,33 @@ pub(crate) fn parse_retry_policy(
     Ok(RetryPolicy {
         minimum_backoff: min_backoff,
         maximum_backoff: max_backoff,
+    })
+}
+
+/// Parses a dead letter policy from the proto representation.
+pub(crate) fn parse_dead_letter_policy(
+    dlp_proto: &DeadLetterPolicyProto,
+) -> Result<DeadLetterPolicy, Status> {
+    let dead_letter_topic = parse_topic_name(&dlp_proto.dead_letter_topic)?;
+
+    let max_delivery_attempts = match dlp_proto.max_delivery_attempts {
+        0 => 5,
+        v if v < 5 => {
+            return Err(Status::invalid_argument(
+                "max_delivery_attempts must be between 5 and 100",
+            ))
+        }
+        v if v > 100 => {
+            return Err(Status::invalid_argument(
+                "max_delivery_attempts must be between 5 and 100",
+            ))
+        }
+        v => v,
+    };
+
+    Ok(DeadLetterPolicy {
+        dead_letter_topic,
+        max_delivery_attempts,
     })
 }
 

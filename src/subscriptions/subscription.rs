@@ -8,7 +8,8 @@ use crate::subscriptions::subscription_manager::SubscriptionManagerDelegate;
 use crate::subscriptions::{
     AckId, DeadlineModification, PulledMessage, SubscriptionName, SubscriptionStats,
 };
-use crate::topics::{Topic, TopicMessage};
+use crate::topics::topic_manager::TopicManager;
+use crate::topics::{Topic, TopicMessage, TopicName};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -47,6 +48,9 @@ pub struct SubscriptionInfo {
 
     /// If specified, controls redelivery backoff after nacks/deadline expiry.
     pub retry_policy: Option<RetryPolicy>,
+
+    /// If specified, messages exceeding max delivery attempts are forwarded to a dead letter topic.
+    pub dead_letter_policy: Option<DeadLetterPolicy>,
 }
 
 /// Retry policy for controlling redelivery backoff.
@@ -68,6 +72,15 @@ impl RetryPolicy {
         let backoff = self.minimum_backoff.saturating_mul(2u32.pow(exponent));
         backoff.min(self.maximum_backoff)
     }
+}
+
+/// Dead letter policy for forwarding messages after exceeding max delivery attempts.
+#[derive(Debug, Clone)]
+pub struct DeadLetterPolicy {
+    /// The topic to which dead letter messages should be published.
+    pub dead_letter_topic: TopicName,
+    /// The maximum number of delivery attempts for any message (5-100).
+    pub max_delivery_attempts: i32,
 }
 
 /// Configuration for push subscriptions.
@@ -97,6 +110,7 @@ impl Subscription {
         topic: Arc<Topic>,
         push_registry: PushSubscriptionsRegistry,
         delegate: SubscriptionManagerDelegate,
+        topic_manager: Option<Arc<TopicManager>>,
     ) -> Self {
         let observer = Arc::new(SubscriptionObserver::new());
 
@@ -109,6 +123,7 @@ impl Subscription {
             Arc::clone(&observer),
             push_registry,
             delegate,
+            topic_manager,
         );
         let topic = Arc::downgrade(&topic);
         Self {
@@ -253,12 +268,14 @@ impl SubscriptionInfo {
         ack_deadline: Duration,
         push_config: Option<PushConfig>,
         retry_policy: Option<RetryPolicy>,
+        dead_letter_policy: Option<DeadLetterPolicy>,
     ) -> Self {
         Self {
             name,
             ack_deadline,
             push_config,
             retry_policy,
+            dead_letter_policy,
         }
     }
 
@@ -269,6 +286,7 @@ impl SubscriptionInfo {
             ack_deadline: Duration::from_secs(10),
             push_config: None,
             retry_policy: None,
+            dead_letter_policy: None,
         }
     }
 }

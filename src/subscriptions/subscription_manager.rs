@@ -2,7 +2,8 @@ use crate::paging::Paging;
 use crate::push::PushSubscriptionsRegistry;
 use crate::subscriptions::paging::SubscriptionsPage;
 use crate::subscriptions::*;
-use crate::topics::{AttachSubscriptionError, Topic};
+use crate::topics::topic_manager::TopicManager;
+use crate::topics::{AttachSubscriptionError, GetTopicError, Topic};
 use parking_lot::RwLock;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -15,6 +16,9 @@ pub struct SubscriptionManager {
 
     /// Registry for push subscriptions.
     push_registry: PushSubscriptionsRegistry,
+
+    /// The topic manager, used for validating and resolving dead letter topics.
+    topic_manager: Arc<TopicManager>,
 }
 
 /// The subscription manager internal state.
@@ -34,10 +38,11 @@ pub struct SubscriptionManagerDelegate {
 
 impl SubscriptionManager {
     /// Creates a new `SubscriptionManager`.
-    pub fn new(push_registry: PushSubscriptionsRegistry) -> Self {
+    pub fn new(push_registry: PushSubscriptionsRegistry, topic_manager: Arc<TopicManager>) -> Self {
         let state = Arc::new(RwLock::new(State::new()));
         Self {
             push_registry,
+            topic_manager,
             state: Arc::clone(&state),
         }
     }
@@ -53,12 +58,33 @@ impl SubscriptionManager {
             return Err(CreateSubscriptionError::MustBeInSameProjectAsTopic);
         }
 
+        // Validate the dead letter topic exists if a dead letter policy is configured.
+        let topic_manager_for_dlq = if let Some(ref dlp) = info.dead_letter_policy {
+            self.topic_manager
+                .get_topic(&dlp.dead_letter_topic)
+                .map_err(|e| match e {
+                    GetTopicError::DoesNotExist => {
+                        CreateSubscriptionError::DeadLetterTopicDoesNotExist
+                    }
+                    GetTopicError::Closed => CreateSubscriptionError::Closed,
+                })?;
+            Some(Arc::clone(&self.topic_manager))
+        } else {
+            None
+        };
+
         // Create the subscription and store it in state.
         let subscription = {
             let mut state = self.state.write();
             // Create a delegate that the subscription can use to call back out.
             let delegate = SubscriptionManagerDelegate::new(Arc::clone(&self.state));
-            state.create_subscription(info, topic.clone(), self.push_registry.clone(), delegate)?
+            state.create_subscription(
+                info,
+                topic.clone(),
+                self.push_registry.clone(),
+                delegate,
+                topic_manager_for_dlq,
+            )?
         };
 
         topic
@@ -144,6 +170,7 @@ impl State {
         topic: Arc<Topic>,
         push_registry: PushSubscriptionsRegistry,
         delegate: SubscriptionManagerDelegate,
+        topic_manager: Option<Arc<TopicManager>>,
     ) -> Result<Arc<Subscription>, CreateSubscriptionError> {
         if let Entry::Vacant(entry) = self.subscriptions.entry(info.name.clone()) {
             self.next_id += 1;
@@ -154,6 +181,7 @@ impl State {
                 topic,
                 push_registry,
                 delegate,
+                topic_manager,
             ));
             entry.insert(subscription.clone());
             return Ok(subscription);

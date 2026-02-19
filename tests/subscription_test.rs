@@ -8,10 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+fn new_subscription_manager(topic_manager: &Arc<TopicManager>) -> SubscriptionManager {
+    SubscriptionManager::new(Default::default(), Arc::clone(topic_manager))
+}
+
 #[tokio::test]
 async fn pulling_messages() {
-    let topic_manager = TopicManager::new();
-    let subscription_manager = SubscriptionManager::new(Default::default());
+    let topic_manager = Arc::new(TopicManager::new());
+    let subscription_manager = new_subscription_manager(&topic_manager);
     let (topic, subscription) =
         new_topic_and_subscription(&topic_manager, &subscription_manager).await;
 
@@ -63,8 +67,8 @@ async fn pulling_messages() {
 
 #[tokio::test]
 async fn nack_messages() {
-    let topic_manager = TopicManager::new();
-    let subscription_manager = SubscriptionManager::new(Default::default());
+    let topic_manager = Arc::new(TopicManager::new());
+    let subscription_manager = new_subscription_manager(&topic_manager);
     let (topic, subscription) =
         new_topic_and_subscription(&topic_manager, &subscription_manager).await;
 
@@ -127,8 +131,8 @@ async fn nack_messages() {
 
 #[tokio::test]
 async fn test_delete_subscription() {
-    let topic_manager = TopicManager::new();
-    let subscription_manager = SubscriptionManager::new(Default::default());
+    let topic_manager = Arc::new(TopicManager::new());
+    let subscription_manager = new_subscription_manager(&topic_manager);
     let (_, subscription) = new_topic_and_subscription(&topic_manager, &subscription_manager).await;
 
     // Subscribe to the notifiers, make sure it gets dropped.
@@ -154,13 +158,14 @@ async fn test_delete_subscription() {
 
 #[tokio::test]
 async fn test_push_registry_integration() {
-    let topic_manager = TopicManager::new();
+    let topic_manager = Arc::new(TopicManager::new());
     let push_registry = PushSubscriptionsRegistry::new();
-    let subscription_manager = SubscriptionManager::new(push_registry.clone());
+    let subscription_manager =
+        SubscriptionManager::new(push_registry.clone(), Arc::clone(&topic_manager));
     let push_config = PushConfig::new("http://end.point".to_string(), None, None);
     let (_, subscription) =
         new_topic_and_subscription_fn(&topic_manager, &subscription_manager, |name| {
-            SubscriptionInfo::new(name, Duration::from_secs(10), Some(push_config.clone()), None)
+            SubscriptionInfo::new(name, Duration::from_secs(10), Some(push_config.clone()), None, None)
         })
         .await;
 

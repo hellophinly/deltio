@@ -7,6 +7,9 @@ pub enum CreateSubscriptionError {
     #[error("The topic and the subscription must be in the same project")]
     MustBeInSameProjectAsTopic,
 
+    #[error("The dead letter topic does not exist")]
+    DeadLetterTopicDoesNotExist,
+
     #[error("The subscription manager is closed")]
     Closed,
 }

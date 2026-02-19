@@ -1,8 +1,8 @@
 use deltio::pubsub_proto::publisher_client::PublisherClient;
 use deltio::pubsub_proto::subscriber_client::SubscriberClient;
 use deltio::pubsub_proto::{
-    AcknowledgeRequest, ModifyAckDeadlineRequest, PublishRequest, PubsubMessage,
-    StreamingPullRequest, StreamingPullResponse, Subscription, Topic,
+    AcknowledgeRequest, DeadLetterPolicy as DeadLetterPolicyProto, ModifyAckDeadlineRequest,
+    PublishRequest, PubsubMessage, StreamingPullRequest, StreamingPullResponse, Subscription, Topic,
 };
 use deltio::subscriptions::SubscriptionName;
 use deltio::topics::TopicName;
@@ -291,6 +291,21 @@ pub fn map_to_subscription_resource(
         topic_message_retention_duration: None,
         state: 0,
     }
+}
+
+/// Maps the given parameters to a `Subscription` resource with a dead letter policy.
+pub fn map_to_subscription_resource_with_dlq(
+    subscription_name: &SubscriptionName,
+    topic_name: &TopicName,
+    dead_letter_topic_name: &TopicName,
+    max_delivery_attempts: i32,
+) -> Subscription {
+    let mut resource = map_to_subscription_resource(subscription_name, topic_name);
+    resource.dead_letter_policy = Some(DeadLetterPolicyProto {
+        dead_letter_topic: dead_letter_topic_name.to_string(),
+        max_delivery_attempts,
+    });
+    resource
 }
 
 /// Constructs a streaming ACK request.
