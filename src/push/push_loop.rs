@@ -12,10 +12,12 @@ use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// Contains everything needed to run the push loop.
 pub struct PushLoop {
     interval: Duration,
+    max_concurrency: usize,
     subscription_manager: Arc<SubscriptionManager>,
     push_registry: PushSubscriptionsRegistry,
 }
@@ -24,11 +26,13 @@ impl PushLoop {
     /// Creates a new push loop.
     pub fn new(
         interval: Duration,
+        max_concurrency: usize,
         subscription_manager: Arc<SubscriptionManager>,
         push_registry: PushSubscriptionsRegistry,
     ) -> Self {
         Self {
             interval,
+            max_concurrency,
             subscription_manager,
             push_registry,
         }
@@ -36,22 +40,28 @@ impl PushLoop {
 
     /// Consumes the `PushLoop` by running it.
     pub async fn run(self) {
-        run(self.interval, self.subscription_manager, self.push_registry).await
+        run(
+            self.interval,
+            self.max_concurrency,
+            self.subscription_manager,
+            self.push_registry,
+        )
+        .await
     }
 }
 
 /// Runs the global push subscription loop.
 pub async fn run(
     interval: Duration,
+    max_concurrency: usize,
     subscription_manager: Arc<SubscriptionManager>,
     push_registry: PushSubscriptionsRegistry,
 ) {
-    // This is a pretty crude implementation with little to no resilience in
-    // terms of dealing with push endpoint issues. Additionally, there will be no
-    // mercy towards slow endpoints.
-    // In the future, an alternative implementation could be running a push
-    // loop per subscription and only send a few messages at a time.
-    log::trace!("Starting push loop (interval = {:?})", &interval);
+    log::trace!(
+        "Starting push loop (interval = {:?}, max_concurrency = {})",
+        &interval,
+        max_concurrency
+    );
 
     // The HTTP client to use.
     let client = reqwest::Client::new();
@@ -73,6 +83,7 @@ pub async fn run(
                     subscription,
                     push_config,
                     client.clone(),
+                    max_concurrency,
                 ));
             }
         }
@@ -86,17 +97,28 @@ async fn pull_and_dispatch_messages(
     subscription: Arc<Subscription>,
     push_config: PushConfig,
     client: reqwest::Client,
+    max_concurrency: usize,
 ) {
     // Pull the subscription.
     let deleted_signal = subscription.deleted();
+    let batch_size = (max_concurrency * 2).min(1_000) as u16;
     let fut = async move {
-        let page = match subscription.pull_messages(1_000).await {
+        let page = match subscription.pull_messages(batch_size).await {
             Ok(page) => page,
             Err(PullMessagesError::Closed) => return,
         };
 
+        let semaphore = Arc::new(Semaphore::new(max_concurrency));
         let mut join_set = tokio::task::JoinSet::new();
         for pulled_message in page {
+            // Acquire a permit before spawning to provide backpressure
+            // when concurrency is saturated.
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore closed unexpectedly");
+
             // We'll share the dispatch future so we can ensure it gets polled to completion
             // inside the join set, but we are also able to use it
             // on the outside to wait for either the dispatch to complete, or a short sleep
@@ -109,7 +131,12 @@ async fn pull_and_dispatch_messages(
                 client.clone(),
             )
             .shared();
-            join_set.spawn(dispatch_fut.clone());
+
+            let inner_fut = dispatch_fut.clone();
+            join_set.spawn(async move {
+                inner_fut.await;
+                drop(permit);
+            });
 
             // Wait a bit to increase the likelihood of delivering
             // the messages in order.

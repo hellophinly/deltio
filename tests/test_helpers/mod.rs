@@ -84,7 +84,7 @@ impl TestHost {
         };
 
         // Future for running the push loop.
-        let push_loop = app.push_loop(Duration::from_secs(1));
+        let push_loop = app.push_loop(Duration::from_secs(1), 10);
         let push_loop_fut = async move {
             tokio::select! {
                 _ = push_loop.run() => {},

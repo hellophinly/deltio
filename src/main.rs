@@ -19,6 +19,10 @@ struct Cli {
     #[arg(long, value_name = "MILLIS", default_value = "1000")]
     push_loop_interval: u64,
 
+    /// Maximum number of concurrent HTTP dispatches per push subscription.
+    #[arg(long, value_name = "N", default_value = "10")]
+    push_concurrency: usize,
+
     /// Whether to run Deltio on a single thread instead of a worker pool of threads (one per CPU)
     #[arg(short, long)]
     single_thread: bool,
@@ -76,7 +80,7 @@ async fn main_core(args: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let server = app.server_builder();
     let push_loop_fut = app
-        .push_loop(Duration::from_millis(args.push_loop_interval))
+        .push_loop(Duration::from_millis(args.push_loop_interval), args.push_concurrency)
         .run();
 
     // Start listening (TCP).

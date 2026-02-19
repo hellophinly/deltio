@@ -69,9 +69,10 @@ impl Deltio {
     }
 
     /// Creates the push loop.
-    pub fn push_loop(&self, interval: Duration) -> PushLoop {
+    pub fn push_loop(&self, interval: Duration, max_concurrency: usize) -> PushLoop {
         PushLoop::new(
             interval,
+            max_concurrency,
             Arc::clone(&self.subscription_manager),
             self.push_subscriptions_registry.clone(),
         )
