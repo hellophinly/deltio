@@ -105,12 +105,6 @@ jobs:
             asset_name: deltio-${{ needs.tag.outputs.tag }}-linux-aarch64
             install_linker: gcc-aarch64-linux-gnu
             
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            artifact_name: deltio
-            asset_name: deltio-${{ needs.tag.outputs.tag }}-linux-musl-aarch64
-            install_linker: aarch64-linux-musl-cross
-
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-latest
             artifact_name: deltio
@@ -169,21 +163,12 @@ jobs:
       - name: Install Cross-Platform Linker
         if: ${{ matrix.install_linker }}
         run: |
-          # Special instructions for installing the aarch64 linker for musl
-          if [ "${{ matrix.install_linker }}" = "aarch64-linux-musl-cross" ]; then
-            wget -P ~ https://musl.cc/aarch64-linux-musl-cross.tgz
-            tar -xvf ~/aarch64-linux-musl-cross.tgz -C "${HOME}"
-            echo "${HOME}/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-          else
-            sudo apt-get update
-            sudo apt-get install -y ${{ matrix.install_linker }}
-          fi
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.install_linker }}
 
       # We need to use clang because `ring` (used by `rustls`) won't compile with gcc.
       - name: Configure clang as C and C++ compiler (Linux)
-        # Don't use clang for aarch64 musl Linux, as we're installing a special cross-compiler
-        # for that target.
-        if: ${{ matrix.os == 'ubuntu-latest' && matrix.target != 'aarch64-unknown-linux-musl' }}
+        if: ${{ matrix.os == 'ubuntu-latest' }}
         run: |
           echo "CC=clang" >> "$GITHUB_ENV"
           echo "CXX=clang++" >> "$GITHUB_ENV"
