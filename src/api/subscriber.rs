@@ -3,10 +3,11 @@ use crate::api::parser;
 use crate::pubsub_proto::push_config::{AuthenticationMethod, OidcToken};
 use crate::pubsub_proto::subscriber_server::Subscriber;
 use crate::pubsub_proto::{
-    AcknowledgeRequest, CreateSnapshotRequest, DeleteSnapshotRequest, DeleteSubscriptionRequest,
-    GetSnapshotRequest, GetSubscriptionRequest, ListSnapshotsRequest, ListSnapshotsResponse,
-    ListSubscriptionsRequest, ListSubscriptionsResponse, ModifyAckDeadlineRequest,
-    ModifyPushConfigRequest, PubsubMessage, PullRequest, PullResponse, PushConfig, ReceivedMessage,
+    AcknowledgeRequest, CreateSnapshotRequest, DeadLetterPolicy as DeadLetterPolicyProto,
+    DeleteSnapshotRequest, DeleteSubscriptionRequest, GetSnapshotRequest, GetSubscriptionRequest,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListSubscriptionsRequest,
+    ListSubscriptionsResponse, ModifyAckDeadlineRequest, ModifyPushConfigRequest, PubsubMessage,
+    PullRequest, PullResponse, PushConfig, ReceivedMessage, RetryPolicy as RetryPolicyProto,
     SeekRequest, SeekResponse, Snapshot, StreamingPullRequest, StreamingPullResponse, Subscription,
     UpdateSnapshotRequest, UpdateSubscriptionRequest,
 };
@@ -65,8 +66,23 @@ impl Subscriber for SubscriberService {
             .as_ref()
             .map(parser::parse_push_config)
             .transpose()?;
-        let subscription_info =
-            SubscriptionInfo::new(subscription_name.clone(), ack_deadline, push_config);
+        let retry_policy = request
+            .retry_policy
+            .as_ref()
+            .map(parser::parse_retry_policy)
+            .transpose()?;
+        let dead_letter_policy = request
+            .dead_letter_policy
+            .as_ref()
+            .map(parser::parse_dead_letter_policy)
+            .transpose()?;
+        let subscription_info = SubscriptionInfo::new(
+            subscription_name.clone(),
+            ack_deadline,
+            push_config,
+            retry_policy,
+            dead_letter_policy,
+        );
 
         let topic = self
             .topic_manager
@@ -90,6 +106,9 @@ impl Subscriber for SubscriberService {
                 CreateSubscriptionError::MustBeInSameProjectAsTopic => Status::invalid_argument(
                     "The subscription must be in the same project as the topic",
                 ),
+                CreateSubscriptionError::DeadLetterTopicDoesNotExist => {
+                    Status::not_found("The dead letter topic does not exist")
+                }
                 CreateSubscriptionError::Closed => conflict(),
             })?;
 
@@ -602,7 +621,7 @@ fn get_subscription(
 fn map_to_received_message(m: &PulledMessage) -> ReceivedMessage {
     ReceivedMessage {
         ack_id: m.ack_id().to_string(),
-        delivery_attempt: 0, // m.delivery_attempt() as i32,
+        delivery_attempt: m.delivery_attempt() as i32,
         message: {
             let message = m.message();
             Some(PubsubMessage {
@@ -653,8 +672,20 @@ fn map_to_subscription_resource(
         enable_message_ordering: false,
         expiration_policy: None,
         filter: Default::default(),
-        dead_letter_policy: None,
-        retry_policy: None,
+        dead_letter_policy: info.dead_letter_policy.as_ref().map(|dlp| DeadLetterPolicyProto {
+            dead_letter_topic: dlp.dead_letter_topic.to_string(),
+            max_delivery_attempts: dlp.max_delivery_attempts,
+        }),
+        retry_policy: info.retry_policy.as_ref().map(|rp| RetryPolicyProto {
+            minimum_backoff: Some(prost_types::Duration {
+                seconds: rp.minimum_backoff.as_secs() as i64,
+                nanos: rp.minimum_backoff.subsec_nanos() as i32,
+            }),
+            maximum_backoff: Some(prost_types::Duration {
+                seconds: rp.maximum_backoff.as_secs() as i64,
+                nanos: rp.maximum_backoff.subsec_nanos() as i32,
+            }),
+        }),
         detached: false,
         enable_exactly_once_delivery: false,
         topic_message_retention_duration: None,
