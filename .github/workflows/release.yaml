@@ -80,7 +80,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/386,linux/amd64,linux/arm64
+          platforms: linux/386,linux/amd64
           push: ${{ fromJSON(needs.tag.outputs.push) }}
           tags: ${{ needs.tag.outputs.docker_tags }}
 
