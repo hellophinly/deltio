@@ -28,7 +28,7 @@ jobs:
         id: compute
         run: |
           TAG="edge"
-          DOCKER_BASE="ghcr.io/jeffijoe/deltio"
+          DOCKER_BASE="ghcr.io/phinly/deltio"
           DOCKER_TAGS="$DOCKER_BASE:edge"
           if [[ "$GITHUB_REF" == "refs/tags/v"* ]]; then
             TAG="${GITHUB_REF_NAME:1}"
