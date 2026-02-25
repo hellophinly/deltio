@@ -35,6 +35,7 @@ RUN <<EOF
   TARGET=$(cat .target)
   export CC="clang"
   export CXX="clang++"
+  export AR="ar"
 
   if [ -z "$TARGET" ]; then
     cargo build --release
@@ -60,6 +61,7 @@ RUN <<EOF
   TARGET=$(cat .target)
   export CC="clang"
   export CXX="clang++"
+  export AR="ar"
 
   if [ -z "$TARGET" ]; then
     cargo build --release
