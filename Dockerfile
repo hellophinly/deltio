@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM rust:1.81 AS build
+FROM rust:1.81 AS build
 
 # Install Protocol Buffers.
 RUN apt-get update && apt-get install -y protobuf-compiler clang musl-tools musl-dev
@@ -7,30 +7,20 @@ RUN apt-get update && apt-get install -y protobuf-compiler clang musl-tools musl
 RUN cargo new --bin deltio
 WORKDIR /deltio
 
-# The target platform we are compiling for.
-# Populated by BuildX
-ARG TARGETPLATFORM
-
-# The build platform we are compiling on.
-# Populated by BuildX
-ARG BUILDPLATFORM
-
-# Install the required cross-compiler toolchain based on the target platform.
-# Basically, if the target platform is ARM, then we'll need 
-# the `gcc-arm-linux-gnueabihf` linker, otherwise we'll need
-# the `gcc-multilib`.
-# IMPORTANT: This only seems to work on a x86_64 Linux build platform. 
+# Determine the musl target for the current architecture.
 RUN <<EOF
   set -e;
 
-  # This is the file we will be writing the compilation target to for
-  # subsequent steps.
   touch .target
+  ARCH=$(uname -m)
 
-  if [ "$TARGETPLATFORM" = "linux/amd64" ]; then
+  if [ "$ARCH" = "x86_64" ]; then
     rustup target add x86_64-unknown-linux-musl
     echo -n "x86_64-unknown-linux-musl" > .target
-  elif [ "$TARGETPLATFORM" = "linux/386" ]; then
+  elif [ "$ARCH" = "aarch64" ]; then
+    rustup target add aarch64-unknown-linux-musl
+    echo -n "aarch64-unknown-linux-musl" > .target
+  elif [ "$ARCH" = "i686" ] || [ "$ARCH" = "i386" ]; then
     rustup target add i686-unknown-linux-musl
     echo -n "i686-unknown-linux-musl" > .target
   fi
@@ -45,8 +35,6 @@ COPY ./Cargo.toml ./Cargo.toml
 RUN <<EOF
   set -e;
 
-  # If the build platform is the same as the target platform, we don't
-  # need to use any target.
   TARGET=$(cat .target)
   export CC="clang"
   export CXX="clang++"
@@ -71,8 +59,7 @@ COPY ./src ./src
 # Build for release
 RUN <<EOF
   set -e;
-  # If the build platform is the same as the target platform, we don't
-  # need to use any target.
+
   TARGET=$(cat .target)
   export CC="clang"
   export CXX="clang++"
