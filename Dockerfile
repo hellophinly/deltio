@@ -20,9 +20,6 @@ RUN <<EOF
   elif [ "$ARCH" = "aarch64" ]; then
     rustup target add aarch64-unknown-linux-musl
     echo -n "aarch64-unknown-linux-musl" > .target
-  elif [ "$ARCH" = "i686" ] || [ "$ARCH" = "i386" ]; then
-    rustup target add i686-unknown-linux-musl
-    echo -n "i686-unknown-linux-musl" > .target
   fi
 EOF
 
